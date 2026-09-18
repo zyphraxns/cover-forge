@@ -18,10 +18,13 @@ import { chromium } from 'playwright-core';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const APP = 'file://' + path.resolve(here, '..', 'index.html');
-/* 输出目录按 PID 隔离两个目的：
-   1. 绝不 rmSync 掉 QA 同事的 output/ 与 output-verify/ 报告；
-   2. 多名队友并行跑同一个脚本时，不会互相删掉对方的 fixtures / 下载文件。 */
-const OUT = path.join(here, 'output-designer-' + process.pid);
+/* 输出目录：tests/output/ —— 与 README / USAGE / CONTRIBUTING 中写明的路径一致。
+   历史说明：这里曾用 `output-designer-<pid>` 按 PID 隔离，起因是当时两个脚本都会
+   `rmSync` 同一个 output/、互相删产物。现在 qa.mjs 只 `mkdirSync` 从不删除，
+   verify.mjs 也只清自己的 output-verify/，冲突已不存在；而带 PID 的目录名会让
+   「文档指明的报告路径」永远停留在旧文件上（排查 Issue #2 时真的被它误导过）。
+   两套脚本的报告文件名不同（QA-REPORT.md / VERIFY-REPORT.md），可安全共存。 */
+const OUT = path.join(here, 'output');
 const FIX = path.join(OUT, 'fixtures');
 const DL = path.join(OUT, 'downloads');
 
@@ -185,7 +188,11 @@ async function makeFixtures(browser) {
     'photo-16x9.jpg': { w: 1920, h: 1080, type: 'image/jpeg', q: 0.9,  alpha: false },
     'small-4x3.png':  { w: 400,  h: 300,  type: 'image/png',  q: 1,    alpha: false },
     'alpha-square.png': { w: 1200, h: 1200, type: 'image/png', q: 1,   alpha: true },
-    'tall-9x16.png':  { w: 900,  h: 1600, type: 'image/png',  q: 1,    alpha: false }
+    'tall-9x16.png':  { w: 900,  h: 1600, type: 'image/png',  q: 1,    alpha: false },
+    /* Issue #2 回归用极小样图：短边 < 16px 时曾被 16px 下限抹平比例 */
+    'tiny-4x4.png':   { w: 4,    h: 4,    type: 'image/png',  q: 1,    alpha: false },
+    'tiny-1x1.png':   { w: 1,    h: 1,    type: 'image/png',  q: 1,    alpha: false },
+    'tiny-10x10.png': { w: 10,   h: 10,   type: 'image/png',  q: 1,    alpha: false }
   };
 
   const b64s = {};
@@ -401,6 +408,43 @@ async function makeFixtures(browser) {
   // 预览不是空白
   const blank = await page.evaluate(() => window.__forge.canvasIsBlank());
   assert('2.5', '舞台画布真的画出了成片（非空白）', 'false', String(blank), blank === false);
+
+  /* ── Issue #2 回归 · 极小源图不得因 16px 下限而改变输出比例 ──────────────
+     根因：computeGeometry() 曾对 outW/outH 各自 clamp(·,16,12000)，把 4×4+4:3 压成 16×16。
+     修法：短边不足 16 时按「裁切区整数倍」整体放大（4×3 → ×6 → 24×18），得到的是精确比例。
+     说明：4×4 源请求 16:9 时，整数裁切区为 4×2（=2:1）—— 这是「整数像素裁切」的量化限制，
+     与 16px 下限无关，故该例只断言「尺寸 + 输出比例 == 裁切区比例」，不苛求 == 理想比例。 */
+  const tinyCases = [
+    { file: 'tiny-4x4.png',   rw: 4,  rh: 3, cw: 4,  ch: 3,  ew: 24, eh: 18, exact: true },
+    { file: 'tiny-1x1.png',   rw: 1,  rh: 1, cw: 1,  ch: 1,  ew: 16, eh: 16, exact: true },
+    { file: 'tiny-10x10.png', rw: 1,  rh: 1, cw: 10, ch: 10, ew: 20, eh: 20, exact: true },
+    { file: 'tiny-4x4.png',   rw: 16, rh: 9, cw: 4,  ch: 2,  ew: 32, eh: 16, exact: false }
+  ];
+  const tinyBad = [];
+  for (let i = 0; i < tinyCases.length; i++) {
+    const c = tinyCases[i];
+    await page.setInputFiles('#file-input', files[c.file].path);
+    await waitIdle(page);
+    await set('#ratio-w', c.rw);
+    await set('#ratio-h', c.rh);
+    await page.click('#btn-apply-ratio');
+    await waitIdle(page);
+    const d = await page.evaluate(() => window.__forge.dims());
+    const sizeOk = d.w === c.ew && d.h === c.eh;                  // 输出尺寸精确
+    const minOk = Math.min(d.w, d.h) >= 16;                       // 短边仍守住 16px 下限
+    const cropErr = Math.abs((d.w / d.h) / (c.cw / c.ch) - 1);    // 输出比例 == 裁切区比例（不变形、不被抹平）
+    const idealErr = Math.abs((d.w / d.h) / (c.rw / c.rh) - 1);   // 输出比例 == 所选比例
+    const pass = sizeOk && minOk && cropErr < 0.01 && (!c.exact || idealErr < 0.01);
+    if (!pass) tinyBad.push(`${c.file} ${c.rw}:${c.rh} → ${d.w}×${d.h}`);
+    const detail = c.exact
+      ? `${d.text} · 比例误差 ${(idealErr * 100).toFixed(3)}%`
+      : `${d.text} · 裁切区 ${c.cw}×${c.ch}（整数量化偏差 ${(idealErr * 100).toFixed(1)}%，非下限所致）`;
+    assert(`2.${6 + i}`, `Issue #2 回归：${c.file} + ${c.rw}:${c.rh} → ${c.ew}×${c.eh}（短边 ≥ 16、比例保持）`,
+      `${c.ew}×${c.eh}，输出比例误差 ${c.exact ? '< 1%' : '（对裁切区）< 1%'}`,
+      detail, pass);
+  }
+  assert(`2.${6 + tinyCases.length}`, 'Issue #2 回归汇总：极小源图输出短边均 ≥ 16 且比例未被 16px 下限抹平',
+    '全部通过', tinyBad.length ? tinyBad.join('; ') : '全部通过', tinyBad.length === 0);
 
   /* ═══ 用例 3 · 大图 + 500KB 目标 ═════════════════════════════════════ */
   group('3 · 目标体积压缩');

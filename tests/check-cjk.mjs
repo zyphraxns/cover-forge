@@ -1,7 +1,11 @@
-/* 临时：切到英文后，全量扫描 DOM 里残留的中文（文本节点 + 常用属性）。跑完即删。 */
+/* 检查：切到英文后，全量扫描 DOM 里残留的中文（文本节点 + 常用属性）。
+ * 用法：node check-cjk.mjs [url]     url 缺省为本地 file://，也可传线上地址。 */
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 
-const APP = 'file:///Users/liamqiu/WorkBuddy/2026-09-18-11-27-07/cover-forge/index.html';
+const APP = process.argv[2] ||
+  'file://' + path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'index.html');
 const CJK = /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/;
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -68,4 +72,6 @@ real.forEach((f) => console.log('  ' + f));
 
 await ctx.close();
 await browser.close();
-process.exit(found.length ? 1 : 0);
+// 退出码必须用 real，而不是 found —— 否则「0 处残留」也会 exit=1，
+// 一个永远失败的检查只会让人学会忽略它。
+process.exit(real.length ? 1 : 0);

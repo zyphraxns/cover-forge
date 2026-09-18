@@ -173,6 +173,11 @@
   const TINY_TARGET_BYTES = 50 * 1024;
   const LARGE_PIXELS = 8e6;
 
+  // 输出尺寸边界。注意：这两条是「画布经验下限/上限」，**绝不能**对宽高各自钳制，
+  // 否则会把所选比例抹平（4×4 源 + 4:3 曾变成 16×16，见 Issue #2）。触边时必须整体等比。
+  const MIN_OUT = 16;
+  const MAX_OUT = 12000;
+
   const Q_MIN = 0.4;    // 质量下限：再低不如降分辨率
   const Q_MAX = 0.95;   // 质量上限
   const Q_UNLIMITED = 0.92;
@@ -249,8 +254,21 @@
     } else {
       outW = cropW; outH = cropH;
     }
-    outW = clamp(outW, 16, 12000);
-    outH = clamp(outH, 16, 12000);
+    // 下界：短边不足 MIN_OUT 时，用「裁切区的整数倍」放大 —— cropW/cropH 本身就代表
+    // 目标比例，取整数倍得到的是精确比例，绝不为了凑 16px 把比例抹平。
+    // 上界：超过 MAX_OUT 时整体等比缩小，同样不能各自截断。
+    if (outW < MIN_OUT || outH < MIN_OUT) {
+      const n = Math.ceil(MIN_OUT / Math.min(cropW, cropH));
+      outW = cropW * n;
+      outH = cropH * n;
+    }
+    if (outW > MAX_OUT || outH > MAX_OUT) {
+      const k = MAX_OUT / Math.max(outW, outH);
+      outW = Math.round(outW * k);
+      outH = Math.round(outH * k);
+    }
+    outW = clamp(outW, 1, MAX_OUT);
+    outH = clamp(outH, 1, MAX_OUT);
 
     const factor = Math.max(outW / cropW, outH / cropH);
 
@@ -303,10 +321,23 @@
     return canvas;
   }
 
-  /** 按比例缩放一张画布（保持宽高比，最小 16px）。 */
+  /**
+   * 等比把 (w,h) 的短边抬到 ≥ min。两边都已达标则原样返回。
+   * 与 computeGeometry() 一样：这里**绝不能**对宽高各自 Math.max(min, ·) ——
+   * 那会把 7×5 抹成 16×16。抽成共用工具，避免同一错误模式写第三遍。
+   */
+  function scaleToMinEdge(w, h, min) {
+    w = Math.max(1, Math.round(w));
+    h = Math.max(1, Math.round(h));
+    if (w >= min && h >= min) return { w: w, h: h };
+    const k = min / Math.min(w, h);
+    return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) };
+  }
+
+  /** 按比例缩放一张画布（保持宽高比，短边不小于 MIN_OUT）。 */
   function scaleCanvas(srcCanvas, scale) {
-    const w = Math.max(16, Math.round(srcCanvas.width * scale));
-    const h = Math.max(16, Math.round(srcCanvas.height * scale));
+    const dim = scaleToMinEdge(srcCanvas.width * scale, srcCanvas.height * scale, MIN_OUT);
+    const w = dim.w, h = dim.h;
     const { canvas, ctx } = makeCanvas(w, h);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
